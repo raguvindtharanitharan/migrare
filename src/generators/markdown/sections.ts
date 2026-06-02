@@ -80,12 +80,13 @@ export function renderVisualEncodings(encodings: VisualEncoding[]): string {
     encodings.length > 0
       ? encodings.map(encodingSummaryLine).join('\n') + '\n\n'
       : '';
-  // Omit selectedMeasures when empty to keep YAML clean
-  const encodingsForYaml = encodings.map((enc) =>
-    enc.selectedMeasures.length === 0
-      ? (({ selectedMeasures, ...rest }) => rest)(enc)
-      : enc
-  );
+  // Omit selectedMeasures when empty or when the worksheet is not a text table
+  // (charts/maps get column-instance measures too, but the field is only
+  // semantically meaningful for automatic/table mark types).
+  const encodingsForYaml = encodings.map((enc) => {
+    const omit = enc.selectedMeasures.length === 0 || enc.effectiveMarkType !== 'automatic';
+    return omit ? (({ selectedMeasures, ...rest }) => rest)(enc) : enc;
+  });
   return section(
     'Visual Encodings',
     'How each worksheet maps fields onto its mark and shelves. The richest section in the model — drives code generation in v0.2.',

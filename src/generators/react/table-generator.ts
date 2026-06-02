@@ -25,6 +25,68 @@ export function resolveTableSpec(workbook: TableauWorkbook, worksheetName: strin
   const fieldMap = buildFieldMap(workbook);
   const dimInputs = fieldsUsedByDimensionCalcs(workbook);
 
+  // ── Detect date pivot columns (yr:, qr:, month:, etc. on columns shelf) ──
+  const dateTruncCols = encoding.columns.filter((c) => isDateTrunc(c.field));
+  const hasDatePivot = dateTruncCols.length > 0;
+
+  // ── Detect transposed Measure Names (MN on rows shelf) ──
+  const hasMeasureNamesOnRows = encoding.rows.some((r) => r.field.includes('Measure Names'));
+
+  if (hasDatePivot) {
+    const periods = generateDatePeriods(dateTruncCols);
+    const periodCols = periods.map((p) => makeColumn(p, 'number'));
+
+    if (hasMeasureNamesOnRows) {
+      // Transposed: each measure becomes a row, date periods become columns
+      const measures = encoding.selectedMeasures.length > 0
+        ? encoding.selectedMeasures
+        : ['Value'];
+      const labelCol: TableColumn = { key: 'Measure', label: 'Measure', numeric: false, currency: false, percent: false };
+      const columns = [labelCol, ...periodCols];
+      const sampleRows = measures.map((name) => {
+        const isPercent = /rate|ratio|pct|percent|growth|yoy|mom|change|%/i.test(name);
+        const amounts = isPercent
+          ? [0.82, 0.85, 0.79, 0.88, 0.91, 0.84, 0.76, 0.93]
+          : [1_240_500, 847_320, 3_102_400, 509_800, 2_765_000, 182_600, 4_320_100, 95_400];
+        const row: Record<string, unknown> = { Measure: name };
+        periods.forEach((p, i) => { row[p] = amounts[i % amounts.length]; });
+        return row;
+      });
+      return { columns, sampleRows };
+    }
+
+    // Standard date pivot: dims on rows, date periods as columns
+    const dimColumns: TableColumn[] = encoding.rows
+      .filter((r) => r.role !== 'measure')
+      .map((r) => {
+        const name = r.caption ?? resolveFieldName(r.field, fieldMap);
+        return name && !/(Measure Names|Latitude|Longitude)/i.test(name)
+          ? makeColumn(name, 'string')
+          : null;
+      })
+      .filter((c): c is TableColumn => c !== null);
+
+    // Determine if values are currency or percent from the primary measure
+    const primaryMeasure = encoding.selectedMeasures[0] ?? '';
+    const isPercent = /rate|ratio|pct|percent|growth|yoy|mom|change|%/i.test(primaryMeasure);
+    const amounts = isPercent
+      ? [0.12, -0.05, 0.08, 0.25, 0.15, 0.07, 0.20, -0.03]
+      : [1_240_500, 847_320, 3_102_400, 509_800, 2_765_000, 182_600, 4_320_100, 95_400];
+    const dimValues = dimColumns.length > 0
+      ? generateSampleDimValues(dimColumns[0].label, 6)
+      : ['Row 1', 'Row 2', 'Row 3'];
+
+    const columns = [...dimColumns, ...periodCols];
+    const sampleRows = dimValues.map((dimVal, i) => {
+      const row: Record<string, unknown> = dimColumns.length > 0 ? { [dimColumns[0].key]: dimVal } : {};
+      periods.forEach((p, j) => { row[p] = amounts[(i + j) % amounts.length]; });
+      return row;
+    });
+    return { columns, sampleRows };
+  }
+
+  // ── Standard table (no date pivot) ──
+
   // Dimensions from rows shelf (GROUP BY columns)
   const dimColumns: TableColumn[] = encoding.rows
     .filter((r) => r.role !== 'measure')
@@ -48,24 +110,13 @@ export function resolveTableSpec(workbook: TableauWorkbook, worksheetName: strin
   let measureColumns: TableColumn[];
 
   if (hasPivot) {
-    // Pivot table: expand the pivot dimension into one column per distinct value.
-    // Values come from THEN clauses in the dimension's calculation formula.
-    const pivotMeasureName = encoding.selectedMeasures[0];
     const pivotValueColumns: TableColumn[] = [];
-
     for (const pivotRef of pivotDimRefs) {
       const dimName = pivotRef.caption ?? resolveFieldName(pivotRef.field, fieldMap);
-      const pivotValues = extractPivotValues(dimName, workbook);
-
-      for (const val of pivotValues) {
+      for (const val of extractPivotValues(dimName, workbook)) {
         pivotValueColumns.push(makeColumn(val, 'number'));
-        if (pivotMeasureName) {
-          // key = "<bucketValue>" already set by makeColumn
-          // Override key to include the measure name when multiple measures exist
-        }
       }
     }
-
     measureColumns = pivotValueColumns;
   } else if (hasMeasureNames) {
     if (encoding.selectedMeasures.length > 0) {
@@ -282,8 +333,10 @@ export function DataTable({ title, columns, rows, isSampleData = false }: DataTa
 
 function makeColumn(name: string, type: 'string' | 'number'): TableColumn {
   const isPercentOfTotal = name.startsWith('% of ');
-  const currency = !isPercentOfTotal && type === 'number' && /amount|revenue|sales|cost|price|gross|net|paid|outstanding|balance/i.test(name);
-  const percent = isPercentOfTotal || (type === 'number' && /rate|ratio|pct|percent|growth|yoy|mom|change|%/i.test(name));
+  // currency and percent are mutually exclusive — percent wins when both patterns match
+  const matchesPercent = isPercentOfTotal || (type === 'number' && /rate|ratio|pct|percent|growth|yoy|mom|change|%/i.test(name));
+  const currency = !matchesPercent && type === 'number' && /amount|revenue|sales|cost|price|gross|net|paid|outstanding|balance/i.test(name);
+  const percent = matchesPercent;
   return {
     key: name,
     label: cleanColumnLabel(name),
@@ -295,9 +348,9 @@ function makeColumn(name: string, type: 'string' | 'number'): TableColumn {
 
 function cleanColumnLabel(name: string): string {
   return name
-    .replace(/^_+\s*/, '')   // strip leading underscores
-    .replace(/^\.\s*/, '')    // strip leading dot
-    .replace(/\s*\(Invoiced Currency\)\s*/i, '')  // strip common Tableau suffixes
+    .replace(/^_+\s*/, '')             // strip leading underscores
+    .replace(/^\.\s*/, '')              // strip leading dot
+    .replace(/\s*\([^)]*Currency[^)]*\)\s*/gi, '')  // strip any "(...Currency...)" Tableau suffix
     .replace(/\s*\(copy\)\s*/i, '')
     .trim();
 }
@@ -306,6 +359,51 @@ function resolveFieldName(field: string, fieldMap: Map<string, string>): string 
   const parts = field.split(':');
   const internal = parts.length >= 3 ? parts.slice(1, -1).join(':') : field;
   return fieldMap.get(internal) ?? fieldMap.get(field) ?? cleanRef(internal);
+}
+
+// ─── Date pivot helpers ───────────────────────────────────────────────────────
+
+// Tableau date-truncation prefixes: yr, qr, month, week, day, hr, mn, sec,
+// and the trunc-* family (trunc-year, trunc-month, trunc-quarter, etc.).
+function isDateTrunc(field: string): boolean {
+  return /^(yr|qr|month|week|day|hr|mn|sec|trunc[^:]*|datepart|datetrunc):/i.test(field);
+}
+
+function generateDatePeriods(dateCols: { field: string }[]): string[] {
+  const fields = dateCols.map((c) => c.field.toLowerCase());
+  const hasQuarter = fields.some((f) => f.startsWith('qr:') || f.startsWith('trunc-quarter:'));
+  const hasMonth   = fields.some((f) => f.startsWith('month:') || f.startsWith('trunc-month:'));
+
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const currentQ = Math.floor(now.getMonth() / 3) + 1;
+
+  if (hasMonth) {
+    // Last 6 complete months relative to today
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return Array.from({ length: 6 }, (_, i) => {
+      const d = new Date(now.getFullYear(), now.getMonth() - 5 + i, 1);
+      return `${months[d.getMonth()]} ${d.getFullYear()}`;
+    });
+  }
+  if (hasQuarter) {
+    // Last 8 quarters relative to today
+    return Array.from({ length: 8 }, (_, i) => {
+      let q = currentQ - 7 + i;
+      let y = currentYear;
+      while (q <= 0) { q += 4; y--; }
+      while (q > 4)  { q -= 4; y++; }
+      return `Q${q} ${y}`;
+    });
+  }
+  // Year-level: last 4 fiscal years
+  return Array.from({ length: 4 }, (_, i) => `FY${currentYear - 3 + i}`);
+}
+
+// Single authoritative dim sampler — used by both standard and date-pivot paths.
+function generateSampleDimValues(label: string, count: number): string[] {
+  // Delegate to sampleDimValue for consistent values across all table types
+  return Array.from({ length: count }, (_, i) => String(sampleDimValue(label, i)));
 }
 
 // Extract distinct pivot values from a dimension's IF/THEN/ELSE formula.

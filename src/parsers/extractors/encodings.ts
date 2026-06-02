@@ -118,8 +118,10 @@ function extractMeasuresFromColumnInstances(view: any, lookup: FieldLookup): str
       // Skip pure table calcs that require window functions
       if (/^(running_sum|lookup|window|rank|size|index|first|last|previous_value):/i.test(colRef)) continue;
 
-      // Must start with a known measure aggregation
-      if (!/^(sum|avg|min|max|cnt|count|median|stdev|var|attr):/i.test(colRef)) continue;
+      // Must start with a numeric measure aggregation.
+      // attr: is Tableau's Attribute function — it is a dimension aggregation
+      // (returns a value only when all rows agree), NOT a numeric measure.
+      if (!/^(sum|avg|min|max|cnt|count|median|stdev|var):/i.test(colRef)) continue;
 
       const caption = resolveFieldName(colRef, lookup)?.caption;
       if (caption && !resolved.includes(caption)) resolved.push(caption);

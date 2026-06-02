@@ -122,9 +122,18 @@ export function generateDashboardComponent(workbook: TableauWorkbook, slug: stri
 
   const zonesJsx = zones.map((z) => renderZone(z)).join('\n');
 
-  // Build DataTable import only when at least one table zone exists
+  // Build DataTable import only when at least one table zone exists.
+  // Deduplicate by varName — two worksheets producing the same identifier
+  // would cause a duplicate import binding compile error.
   const tableZones = zones.filter((z) => z.isTable && z.dataFile);
+  const seenVarNames = new Set<string>();
   const dataImports = tableZones
+    .filter((z) => {
+      const v = dataVarName(z.internalName);
+      if (seenVarNames.has(v)) return false;
+      seenVarNames.add(v);
+      return true;
+    })
     .map((z) => `import ${dataVarName(z.internalName)} from '${z.dataFile}';`)
     .join('\n');
   const hasTable = tableZones.length > 0;
@@ -237,7 +246,8 @@ function renderZone(z: ZoneViewModel): string {
 // ─── Local helpers ────────────────────────────────────────────────────────────
 
 function esc(s: string): string {
-  return s.replace(/'/g, "\\'").replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  // Also escape */ to prevent it from prematurely closing JSX block comments
+  return s.replace(/'/g, "\\'").replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\*\//g, '*\\/');
 }
 
 function fallbackComponent(name: string): string {
