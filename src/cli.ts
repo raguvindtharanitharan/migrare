@@ -11,6 +11,8 @@ import { generateVisualBlueprint } from './generators/visual-blueprint.js';
 import { generateLayoutHtml } from './generators/layout-html.js';
 import { scaffoldStaticFiles } from './generators/react/scaffolder.js';
 import { generateDashboardComponent, type DashboardGeneratorResult } from './generators/react/dashboard-component.js';
+import { generateApiServer } from './generators/react/api-server.js';
+import { extractToParquet } from './extractors/hyper-extractor.js';
 import { generateAppTsx, generateWorkbookListTsx } from './generators/react/app-shell.js';
 import { generateReportIndex, toSubdirName, type IndexEntry } from './generators/report-index.js';
 import { enrichWorkbook, type EnrichStep } from './enrichers/index.js';
@@ -326,7 +328,19 @@ program
           await analyzeOne(file, { enrich: options.enrich ?? false });
         }
         const workbook = await parseWorkbook(file);
-        workbooks.push({ file, workbook, slug: toSubdirName(parsed.base) });
+        const slug = toSubdirName(parsed.base);
+
+        // Extract .hyper → .parquet (requires Python + tableauhyperapi + pyarrow)
+        const parquetDir = path.join(outputDir, 'api', 'data');
+        log.info(`  ↳ Extracting data from ${chalk.bold(parsed.base)}...`);
+        const extraction = await extractToParquet(file, parquetDir, slug);
+        if (extraction.tables.length > 0) {
+          log.success(`  Extracted ${extraction.tables.length} table(s) → api/data/`);
+        } else {
+          log.warn(`  No data extracted — API will return empty results. Install: pip install tableauhyperapi pyarrow`);
+        }
+
+        workbooks.push({ file, workbook, slug, parquetTables: extraction.tables });
       }
 
       // Scaffold static files
@@ -341,10 +355,11 @@ program
 
       // Generate per-workbook Dashboard.tsx + layout-preview.html
       const entries = [];
-      for (const { workbook, slug } of workbooks) {
+      for (const { workbook, slug, parquetTables } of workbooks) {
         const dashDir = path.join(outputDir, 'src', 'workbooks', slug);
         await mkdir(dashDir, { recursive: true });
-        const { dashboardTsx, dataFiles } = generateDashboardComponent(workbook, slug);
+        const { serverTs: _s, specs: querySpecs } = generateApiServer(workbook, parquetTables, slug);
+        const { dashboardTsx, dataFiles } = generateDashboardComponent(workbook, slug, querySpecs);
         await writeFile(path.join(dashDir, 'Dashboard.tsx'), dashboardTsx, 'utf-8');
         for (const df of dataFiles) {
           const dest = path.join(outputDir, df.relativePath);
@@ -361,6 +376,16 @@ program
       // Generate App.tsx + WorkbookList.tsx
       await writeFile(path.join(outputDir, 'src', 'App.tsx'), generateAppTsx(entries), 'utf-8');
       await writeFile(path.join(outputDir, 'src', 'WorkbookList.tsx'), generateWorkbookListTsx(entries), 'utf-8');
+
+      // Generate one combined API server covering all workbooks
+      await mkdir(path.join(outputDir, 'api'), { recursive: true });
+      const allParquetTables = workbooks.flatMap((w) => w.parquetTables);
+      // Use first workbook to generate the server (sources list covers all)
+      if (workbooks.length > 0) {
+        const { serverTs } = generateApiServer(workbooks[0].workbook, allParquetTables, workbooks[0].slug);
+        await writeFile(path.join(outputDir, 'api', 'server.ts'), serverTs, 'utf-8');
+        log.success(`  ${chalk.cyan('api/server.ts')} (Express + DuckDB, ${allParquetTables.length} source${allParquetTables.length === 1 ? '' : 's'})`);
+      }
 
       const elapsed = ((performance.now() - start) / 1000).toFixed(2);
       log.success(`Done in ${elapsed}s`);

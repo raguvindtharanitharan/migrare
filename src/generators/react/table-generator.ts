@@ -230,7 +230,8 @@ function sampleDimValue(label: string, i: number): string {
 // ─── DataTable.tsx component template ────────────────────────────────────────
 
 export function dataTableComponentSource(): string {
-  return `import type React from 'react';
+  return `import { useState, useEffect } from 'react';
+import type React from 'react';
 
 export interface DataTableColumn {
   key: string;
@@ -240,17 +241,45 @@ export interface DataTableColumn {
   percent: boolean;
 }
 
+export interface DimSpec {
+  alias: string;
+  expr: string;
+}
+
+export interface PivotSpec {
+  expr: string;
+  values: string[];
+  measureExpr: string;
+  totalAlias?: string;
+}
+
+export interface QuerySpec {
+  source: string;
+  dimensions?: DimSpec[];
+  measures?: Array<{ alias: string; expr: string }>;
+  filterFields?: string[];
+  orderBy?: { column: string; direction?: string };
+  pivotOn?: PivotSpec;
+}
+
 export interface DataTableProps {
   title?: string;
+  /** Query spec — posted to /api/query for live data */
+  querySpec?: QuerySpec;
+  /** Active filter values matched to querySpec.filterFields */
+  filters?: Record<string, string | null | undefined>;
+  /** Static rows — sample data shown when querySpec is absent or API unavailable */
+  rows?: Record<string, unknown>[];
   columns: DataTableColumn[];
-  rows: Record<string, unknown>[];
   isSampleData?: boolean;
+  /** Rows per page for server-side pagination (default: 50) */
+  pageSize?: number;
 }
 
 const tableStyle: React.CSSProperties = {
   width: '100%',
   borderCollapse: 'collapse',
-  fontSize: 13,
+  fontSize: 10,
   fontFamily: "'Poppins', sans-serif",
 };
 
@@ -288,41 +317,136 @@ function formatValue(val: unknown, col: DataTableColumn): string {
   return String(val);
 }
 
-export function DataTable({ title, columns, rows, isSampleData = false }: DataTableProps) {
+export function DataTable({ title, querySpec, filters, columns, rows: staticRows = [], isSampleData = false, pageSize = 50 }: DataTableProps) {
+  const [rows, setRows] = useState<Record<string, unknown>[]>(staticRows);
+  const [loading, setLoading] = useState(!!querySpec);
+  const [error, setError] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
+  // For pivot tables with no pre-defined values, columns come from the API response
+  const [dynamicColumns, setDynamicColumns] = useState<DataTableColumn[] | null>(null);
+  const displayColumns = dynamicColumns ?? columns;
+
+  useEffect(() => {
+    setPage(1);
+  }, [querySpec?.source, JSON.stringify(filters)]);
+
+  useEffect(() => {
+    if (!querySpec) { setRows(staticRows); return; }
+    setLoading(true);
+    setError(null);
+    const body = {
+      ...querySpec,
+      filters: Object.fromEntries(
+        (querySpec.filterFields ?? []).map((f) => [f, filters?.[f] ?? null])
+      ),
+      page,
+      pageSize,
+    };
+    fetch('/api/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then((r) => { if (!r.ok) throw new Error(\`API \${r.status}: \${r.statusText}\`); return r.json(); })
+      .then((data: Record<string, unknown>[]) => {
+        // For pivot tables with dynamic values, derive column list from first response row
+        if (querySpec.pivotOn && querySpec.pivotOn.values.length === 0 && data.length > 0) {
+          const dimKeys = (querySpec.dimensions ?? []).map((d) => (typeof d === 'string' ? d : d.alias));
+          const allKeys = Object.keys(data[0]);
+          const pivotKeys = allKeys.filter((k) => !dimKeys.includes(k));
+          const totalAlias = querySpec.pivotOn.totalAlias ?? 'Total';
+          const bucketKeys = pivotKeys.filter((k) => k !== totalAlias);
+          const newCols: DataTableColumn[] = [
+            ...dimKeys.map((k) => ({ key: k, label: k, numeric: false, currency: false, percent: false })),
+            ...bucketKeys.map((k) => ({ key: k, label: k, numeric: true, currency: false, percent: false })),
+            { key: totalAlias, label: totalAlias, numeric: true, currency: false, percent: false },
+          ];
+          setDynamicColumns(newCols);
+        }
+        setRows(data);
+        setHasMore(data.length === pageSize);
+        setLoading(false);
+      })
+      .catch((e: Error) => {
+        // Fall back to sample data silently when API fails but static rows are available
+        if (staticRows.length > 0) {
+          setError(null);
+          setRows(staticRows);
+        } else {
+          setError(e.message);
+        }
+        setLoading(false);
+      });
+  }, [querySpec?.source, JSON.stringify(filters), page, pageSize, staticRows]);
+
   return (
     <div style={{ fontFamily: "'Poppins', sans-serif", display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
       {title && (
-        <h3 style={{ fontSize: 12, fontWeight: 600, color: '#374151', textTransform: 'uppercase' as const, letterSpacing: '0.06em', marginBottom: 4, flexShrink: 0 }}>
+        <h3 style={{ fontSize: 10, fontWeight: 600, color: '#374151', textTransform: 'uppercase' as const, letterSpacing: '0.06em', marginBottom: 4, flexShrink: 0 }}>
           {title}
         </h3>
       )}
-      {isSampleData && (
-        <div style={{ background: '#fef3c7', border: '1px solid #f59e0b', borderRadius: 4, padding: '3px 10px', marginBottom: 4, fontSize: 11, color: '#92400e', flexShrink: 0 }}>
+      {isSampleData && !querySpec && (
+        <div style={{ background: '#fef3c7', border: '1px solid #f59e0b', borderRadius: 4, padding: '3px 10px', marginBottom: 4, fontSize: 10, color: '#92400e', flexShrink: 0 }}>
           ⚠ Sample data — connect to your data source to see real values
         </div>
       )}
-      <div style={{ overflowX: 'auto', overflowY: 'auto', flex: 1, minHeight: 0 }}>
-        <table style={tableStyle}>
-          <thead>
-            <tr>
-              {columns.map((col) => (
-                <th key={col.key} style={thStyle(col.numeric)}>{col.label}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row, i) => (
-              <tr key={i} style={i % 2 === 1 ? { background: '#f9fafb' } : undefined}>
-                {columns.map((col) => (
-                  <td key={col.key} style={tdStyle(col.numeric)}>
-                    {formatValue(row[col.key], col)}
-                  </td>
+      {loading && (
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', fontSize: 10 }}>
+          Loading…
+        </div>
+      )}
+      {error && (
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#ef4444', fontSize: 10 }}>
+          {error} — is the API server running? (npm run api)
+        </div>
+      )}
+      {!loading && !error && (
+        <>
+          <div style={{ overflowX: 'auto', overflowY: 'auto', flex: 1, minHeight: 0 }}>
+            <table style={tableStyle}>
+              <thead>
+                <tr>
+                  {displayColumns.map((col) => (
+                    <th key={col.key} style={thStyle(col.numeric)}>{col.label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, i) => (
+                  <tr key={i} style={i % 2 === 1 ? { background: '#f9fafb' } : undefined}>
+                    {displayColumns.map((col) => (
+                      <td key={col.key} style={tdStyle(col.numeric)}>
+                        {formatValue(row[col.key], col)}
+                      </td>
+                    ))}
+                  </tr>
                 ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+              </tbody>
+            </table>
+          </div>
+          {querySpec && (page > 1 || hasMore) && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 4px 0', flexShrink: 0 }}>
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page === 1}
+                style={{ fontSize: 10, padding: '3px 10px', border: '1px solid #e2e8f0', borderRadius: 4, background: page === 1 ? '#f8fafc' : 'white', color: page === 1 ? '#94a3b8' : '#374151', cursor: page === 1 ? 'default' : 'pointer' }}
+              >
+                ← Prev
+              </button>
+              <span style={{ fontSize: 10, color: '#64748b' }}>Page {page}</span>
+              <button
+                onClick={() => setPage((p) => p + 1)}
+                disabled={!hasMore}
+                style={{ fontSize: 10, padding: '3px 10px', border: '1px solid #e2e8f0', borderRadius: 4, background: !hasMore ? '#f8fafc' : 'white', color: !hasMore ? '#94a3b8' : '#374151', cursor: !hasMore ? 'default' : 'pointer' }}
+              >
+                Next →
+              </button>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

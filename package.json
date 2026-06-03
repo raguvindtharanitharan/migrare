@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "src/extractors/hyper-to-parquet.py",
     "README.md",
     "LICENSE"
   ],

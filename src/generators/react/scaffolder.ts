@@ -10,6 +10,7 @@ export function scaffoldStaticFiles(appTitle: string): ScaffoldFile[] {
     { relativePath: 'package.json',                    content: packageJson(appTitle) },
     { relativePath: 'vite.config.ts',                  content: viteConfig() },
     { relativePath: 'tsconfig.json',                   content: tsConfig() },
+    { relativePath: 'api/tsconfig.json',               content: apiTsConfig() },
     { relativePath: 'index.html',                      content: indexHtml(appTitle) },
     { relativePath: 'src/main.tsx',                    content: mainTsx() },
     { relativePath: 'src/components/DataTable.tsx',    content: dataTableComponentSource() },
@@ -26,21 +27,30 @@ function packageJson(title: string): string {
     private: true,
     type: 'module',
     scripts: {
-      dev:   'vite',
-      build: 'tsc -b && vite build',
+      dev:     'concurrently "vite" "tsx api/server.ts"',
+      build:   'tsc -b && vite build',
       preview: 'vite preview',
+      api:     'tsx api/server.ts',
     },
     dependencies: {
-      react:            '^19.0.0',
-      'react-dom':      '^19.0.0',
+      react:              '^19.0.0',
+      'react-dom':        '^19.0.0',
       'react-router-dom': '^7.0.0',
+      express:            '^4.18.0',
+      cors:               '^2.8.5',
+      duckdb:             '^1.1.0',
     },
     devDependencies: {
-      '@types/react':        '^19.0.0',
-      '@types/react-dom':    '^19.0.0',
+      '@types/react':         '^19.0.0',
+      '@types/react-dom':     '^19.0.0',
+      '@types/express':       '^4.17.0',
+      '@types/cors':          '^2.8.0',
+      '@types/node':          '^22.0.0',
       '@vitejs/plugin-react': '^4.3.0',
-      typescript:            '^5.7.0',
-      vite:                  '^6.0.0',
+      typescript:             '^5.7.0',
+      vite:                   '^6.0.0',
+      concurrently:           '^8.0.0',
+      tsx:                    '^4.19.0',
     },
   }, null, 2);
 }
@@ -51,8 +61,31 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  server: {
+    proxy: {
+      '/api': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
+    },
+  },
 })
 `;
+}
+
+function apiTsConfig(): string {
+  return JSON.stringify({
+    compilerOptions: {
+      target: 'ES2022',
+      module: 'NodeNext',
+      moduleResolution: 'NodeNext',
+      outDir: '../dist-api',
+      strict: true,
+      skipLibCheck: true,
+      esModuleInterop: true,
+    },
+    include: ['.'],
+  }, null, 2);
 }
 
 function tsConfig(): string {
