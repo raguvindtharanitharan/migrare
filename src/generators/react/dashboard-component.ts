@@ -59,6 +59,16 @@ export function generateDashboardComponent(
   // Build filter field map (non-action filters per worksheet)
   const filtersByWorksheet = buildFiltersByWorksheet(workbook);
 
+  // Map internal calc IDs → captions (e.g. Calculation_316... → "AR Aging Buckets")
+  // Used to resolve filterctrl param refs to human-readable field names.
+  const calcIdToCaption = new Map<string, string>();
+  for (const f of workbook.fields) {
+    if (f.name && f.caption) {
+      const id = f.name.replace(/^\[|\]$/g, '');
+      calcIdToCaption.set(id, f.caption);
+    }
+  }
+
   // Compute max area per worksheet name for control detection
   const areaByName = new Map<string, number>();
   for (const z of leaves) {
@@ -77,8 +87,9 @@ export function generateDashboardComponent(
     const maxArea = areaByName.get(z.worksheetOrName) ?? area;
     const hasEncodings = encoding ? encoding.rows.length > 0 || encoding.columns.length > 0 : false;
     const isTextButton = z.kind === 'worksheet' && !hasEncodings && area < maxArea * 0.5;
-    const isControl = z.kind !== 'worksheet' || (area < maxArea && hasEncodings) || isTextButton;
-    const isTable = !isControl && markType === 'automatic';
+    // filterctrl zones are always controls; worksheet zones are never controls (they are tables or unsupported)
+    const isControl = z.kind === 'filterctrl' || z.kind === 'paramctrl' || z.kind === 'text' || isTextButton;
+    const isTable = !isControl && z.kind === 'worksheet' && markType === 'automatic';
 
     const rowFields = encoding?.rows
       .map((r) => r.caption ?? cleanRef(r.field))
@@ -87,7 +98,15 @@ export function generateDashboardComponent(
       .map((c) => c.caption ?? cleanRef(c.field))
       .filter((n) => n && n !== ':Measure Names') ?? [];
     const hasMeasureNames = encoding?.columns.some((c) => c.field.includes(':Measure Names')) ?? false;
-    const filterFields = filtersByWorksheet.get(z.worksheetOrName) ?? [];
+    // filterctrl zones carry the explicit field ref in worksheetOrName (from zone.filterField)
+    // — resolve via caption map (for calc IDs) then fall back to the cleaned raw ref.
+    const filterFields = z.kind === 'filterctrl'
+      ? (() => {
+          const raw = cleanFilterRef(z.worksheetOrName);
+          const caption = calcIdToCaption.get(raw) ?? raw;
+          return [caption];
+        })()
+      : (filtersByWorksheet.get(z.worksheetOrName) ?? []);
 
     // Resolve table spec — columns for schema, sample rows as fallback
     let tableColumns: TableColumn[] = [];
@@ -131,7 +150,68 @@ export function generateDashboardComponent(
     };
   });
 
-  const zonesJsx = zones.map((z) => renderZone(z)).join('\n');
+  // Build a map of filterField → {source, dim} for dropdown population.
+  // Collect all candidate sources, then pick the one that has the field as an actual
+  // dimension (with its SQL expression). Only fall back to plain column ref when no
+  // table has the field as a dimension.
+  const filterMeta = new Map<string, { source: string; dim: { alias: string; expr: string } }>();
+  // Collect all filter fields mentioned across all table querySpecs
+  const allFilterFields = new Set<string>();
+  for (const z of zones) {
+    if (!z.querySpec) continue;
+    for (const f of z.querySpec.filterFields ?? []) allFilterFields.add(f);
+    for (const d of z.querySpec.dimensions ?? []) allFilterFields.add(d.alias);
+  }
+  for (const field of allFilterFields) {
+    // Prefer the zone that has this field as a real dimension (carries the SQL expr)
+    const zoneWithDim = zones.find((z) => z.querySpec?.dimensions?.some((d) => d.alias === field));
+    if (zoneWithDim?.querySpec) {
+      const d = zoneWithDim.querySpec.dimensions!.find((d) => d.alias === field)!;
+      filterMeta.set(field, { source: zoneWithDim.querySpec.source, dim: d });
+      continue;
+    }
+    // Fall back to any zone that mentions the field in filterFields
+    const zoneWithField = zones.find((z) => z.querySpec?.filterFields?.includes(field));
+    if (zoneWithField?.querySpec) {
+      filterMeta.set(field, {
+        source: zoneWithField.querySpec.source,
+        dim: { alias: field, expr: `"${field}"` },
+      });
+    }
+  }
+  // Resolve filter fields from filterctrl zones not yet in the map (e.g. raw column quick filters).
+  const firstTableSource = zones.find((z) => z.querySpec?.source)?.querySpec?.source;
+  for (const z of zones) {
+    if (!z.isControl) continue;
+    for (const field of z.filterFields) {
+      if (filterMeta.has(field)) continue;
+      const tableWithField = zones.find((t) => t.querySpec?.filterFields?.includes(field));
+      const source = tableWithField?.querySpec?.source ?? firstTableSource;
+      if (!source) continue;
+      const d = tableWithField?.querySpec?.dimensions?.find((d) => d.alias === field);
+      filterMeta.set(field, { source, dim: d ?? { alias: field, expr: `"${field}"` } });
+    }
+  }
+
+  // Collect default values for non-visible (always-on) background filters.
+  // Add them to filterMeta so they reach the table filters props, and pre-populate
+  // filterState so queries match Tableau's default view on first load.
+  const bgDefaults: Record<string, string> = {};
+  for (const f of workbook.filters) {
+    if (f.visible || !f.values || f.values.length !== 1) continue;
+    const field = f.name;
+    // Add to filterMeta if not already there (using the first available table source)
+    if (!filterMeta.has(field) && firstTableSource) {
+      filterMeta.set(field, { source: firstTableSource, dim: { alias: field, expr: `"${field}"` } });
+    }
+    if (filterMeta.has(field)) bgDefaults[field] = f.values[0];
+  }
+  const filterStateInit = Object.keys(bgDefaults).length > 0
+    ? JSON.stringify(bgDefaults)
+    : '{}';
+
+  const hasFilters = filterMeta.size > 0;
+  const zonesJsx = zones.map((z) => renderZone(z, filterMeta)).join('\n');
 
   // Build DataTable import only when at least one table zone exists.
   // Sample data files are imported as fallback; API is used when available.
@@ -152,9 +232,13 @@ export function generateDashboardComponent(
   const dashboardTsx = [
     `/** ${workbook.metadata.name} — layout scaffold generated by drexo */`,
     hasTable ? `import { DataTable } from '../../components/DataTable';` : '',
+    hasFilters ? `import { useState, useEffect } from 'react';` : '',
     hasTable && dataImports ? dataImports : '',
     '',
+    hasFilters ? filterDropdownComponent() : '',
     `export function Dashboard() {`,
+    hasFilters ? `  const [filterState, setFilterState] = useState<Record<string, string | null>>(${filterStateInit});` : '',
+    hasFilters ? `  const setFilter = (field: string, value: string | null) => setFilterState((prev) => ({ ...prev, [field]: value }));` : '',
     `  return (`,
     `    <div style={{ position: 'relative', width: '100%', aspectRatio: ${aspectRatio}, fontFamily: "'Poppins', sans-serif", background: 'white', borderRadius: 8, overflow: 'hidden', boxShadow: '0 1px 4px rgba(0,0,0,0.06)' }}>`,
     zonesJsx,
@@ -162,7 +246,7 @@ export function generateDashboardComponent(
     `  );`,
     `}`,
     '',
-  ].filter((l) => l !== null).join('\n');
+  ].filter((l) => l !== null && l !== false).join('\n');
 
   return { dashboardTsx, dataFiles };
 }
@@ -176,7 +260,7 @@ function dataVarName(worksheetName: string): string {
     .replace(/^_|_$/g, '') + 'Data';
 }
 
-function renderZone(z: ZoneViewModel): string {
+function renderZone(z: ZoneViewModel, filterMeta: Map<string, { source: string; dim: { alias: string; expr: string } }>): string {
   // Table zone — render DataTable with API endpoint + sample fallback
   if (z.isTable && z.tableColumns.length > 0) {
     const varName = z.dataFile ? dataVarName(z.internalName) : null;
@@ -184,13 +268,23 @@ function renderZone(z: ZoneViewModel): string {
       key: c.key, label: c.label, numeric: c.numeric, currency: c.currency, percent: c.percent,
     })), null, 6).replace(/^/gm, '      ');
 
-    // Build querySpec prop if available
     const specJson = z.querySpec
       ? JSON.stringify(z.querySpec, null, 6).replace(/^/gm, '      ')
       : null;
 
-    const filterParamsStr = z.querySpec?.filterFields.length
-      ? `{{ ${z.querySpec.filterFields.map((f) => `"${esc(f)}": undefined`).join(', ')} }}`
+    // Wire filters to shared filterState — null means "no filter applied" (server skips nulls).
+    // Include: declared filterFields, dimension aliases (have SQL expr in dimExprMap),
+    // AND any control-zone filter from the same source (e.g. TRAN_STATUS raw columns).
+    const tableSource = z.querySpec?.source;
+    const filterableFields = Array.from(new Set([
+      ...(z.querySpec?.filterFields ?? []),
+      ...(z.querySpec?.dimensions?.map((d) => d.alias) ?? []),
+      ...Array.from(filterMeta.entries())
+        .filter(([, meta]) => meta.source === tableSource)
+        .map(([field]) => field),
+    ])).filter((f) => filterMeta.has(f));
+    const filterParamsStr = filterableFields.length
+      ? `{{ ${filterableFields.map((f) => `"${esc(f)}": filterState["${esc(f)}"] ?? null`).join(', ')} }}`
       : 'undefined';
 
     return `      {/* ${esc(z.label)} */}
@@ -238,6 +332,18 @@ function renderZone(z: ZoneViewModel): string {
   }
 
   if (z.isControl) {
+    const activeFields = z.filterFields.filter((f) => filterMeta.has(f));
+    // Render live filter dropdowns when we have metadata; fall back to placeholder otherwise
+    if (activeFields.length > 0) {
+      const dropdowns = activeFields.map((f) => {
+        const meta = filterMeta.get(f)!;
+        return `        <FilterDropdown label="${esc(f)}" source="${meta.source}" dim={${JSON.stringify(meta.dim)}} value={filterState["${esc(f)}"] ?? null} onChange={(v) => setFilter("${esc(f)}", v)} />`;
+      }).join('\n');
+      return `      {/* Quick Filter: ${activeFields.map(esc).join(', ')} */}
+      <div style={{ position: 'absolute', left: '${z.left}', top: '${z.top}', width: '${z.width}', height: '${z.height}', boxSizing: 'border-box', padding: 6, display: 'flex', flexDirection: 'row' as const, flexWrap: 'wrap' as const, alignItems: 'flex-start', gap: 6, overflow: 'auto', background: 'white', border: '1px solid #e2e8f0', borderRadius: 6 }}>
+${dropdowns}
+      </div>`;
+    }
     const filterLabel = z.filterFields.length > 0 ? z.filterFields : [z.label];
     const ctrlType = z.filterFields.some(f => /status|type/i.test(f)) ? 'single-value list' : 'dropdown';
     const fieldLines = filterLabel.map(f =>
@@ -266,7 +372,68 @@ function renderZone(z: ZoneViewModel): string {
       </div>`;
 }
 
+// ─── FilterDropdown component template ───────────────────────────────────────
+
+function filterDropdownComponent(): string {
+  return `
+function FilterDropdown({ label, source, dim, value, onChange }: {
+  label: string;
+  source: string;
+  dim: { alias: string; expr: string };
+  value: string | null;
+  onChange: (v: string | null) => void;
+}) {
+  const [options, setOptions] = useState<string[]>([]);
+  useEffect(() => {
+    fetch('/api/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, dimensions: [dim], measures: [], pageSize: 500 }),
+    })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: Record<string, unknown>[]) => {
+        setOptions(
+          rows.map((r) => String(r[dim.alias])).filter((v) => v && v !== 'null').sort()
+        );
+      })
+      .catch(() => {});
+  }, [source, dim.alias]);
+  return (
+    <div style={{ flex: '1 1 100px', minWidth: 90 }}>
+      <div style={{ fontSize: 8, fontWeight: 600, color: '#6b7280', textTransform: 'uppercase' as const, letterSpacing: '0.05em', marginBottom: 2 }}>{label}</div>
+      <select
+        value={value ?? ''}
+        onChange={(e) => onChange(e.target.value || null)}
+        style={{ fontSize: 10, padding: '3px 6px', border: '1px solid #e2e8f0', borderRadius: 4, width: '100%', background: 'white', color: '#374151', cursor: 'pointer' }}
+      >
+        <option value="">All</option>
+        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+    </div>
+  );
+}
+
+`;
+}
+
 // ─── Local helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Clean a raw Tableau field ref from a filterctrl zone's param attribute into a
+ * human-readable field name. The workbook parser stores field captions; this
+ * extracts the internal calc/column name so the generator can resolve it via
+ * filterMeta to the right display name.
+ *
+ * "[excel.xxx].[none:Calculation_3160325163145427:nk]" → "Calculation_3160325163145427"
+ * "[excel.xxx].[none:Company:nk]"                     → "Company"
+ */
+function cleanFilterRef(raw: string): string {
+  const afterDot = raw.includes('].[') ? raw.split('].[').pop()! : raw;
+  const stripped = afterDot.replace(/^\[/, '').replace(/\]$/, '').trim();
+  const noneMatch = stripped.match(/^:?none:(.+?)(?::nk)?$/i);
+  if (noneMatch) return noneMatch[1].trim();
+  return stripped;
+}
 
 function esc(s: string): string {
   // Also escape */ to prevent it from prematurely closing JSX block comments

@@ -49,19 +49,20 @@ function extractSize(db: any): DashboardSize {
 }
 
 function mapZone(zone: any): Zone {
-  const typeV2: string | undefined = zone['@_type-v2'];
+  const typeV2: string | undefined = zone['@_type-v2'] ?? zone['@_type'];
   const name: string | undefined = zone['@_name'];
   const isLayoutZone = typeV2?.startsWith('layout') ?? false;
-  const isWorksheetZone = name !== undefined && !isLayoutZone && typeV2 !== 'paramctrl' && typeV2 !== 'text';
+  const isFilterCtrl = typeV2 === 'filter';
+  const isWorksheetZone = name !== undefined && !isLayoutZone && !isFilterCtrl && typeV2 !== 'paramctrl' && typeV2 !== 'text' && typeV2 !== 'title';
 
-  const type: ZoneType = isWorksheetZone ? 'worksheet' : normalizeZoneType(typeV2);
+  const type: ZoneType = isFilterCtrl ? 'filterctrl' : (isWorksheetZone ? 'worksheet' : normalizeZoneType(typeV2));
 
   const children = zone.zone ? toArray(zone.zone).map((z: any) => mapZone(z)) : [];
 
   // Extract the human-readable label from formatted-text (the visible title shown in the dashboard)
   const displayLabel = extractZoneLabel(zone);
 
-  // Extract paramctrl-specific fields
+  // Extract paramctrl/filterctrl fields
   const controlMode = normalizeControlMode(zone['@_mode']);
   // Strip the datasource namespace prefix generically: '[DataSource].[Name]' → 'Name'
   // Works for any language/locale — does not hardcode 'Parameters'.
@@ -73,11 +74,17 @@ function mapZone(zone: any): Zone {
 
   const showTitle = zone['@_show-title'] !== 'false';
 
+  // filterctrl: extract the field reference from the @_param attribute
+  const filterField = isFilterCtrl && zone['@_param']
+    ? String(zone['@_param'])
+    : undefined;
+
   return {
     id: String(zone['@_id'] ?? ''),
     name,
     worksheet: isWorksheetZone ? name : undefined,
     type,
+    filterField,
     x: parseFloat(zone['@_x'] ?? '0'),
     y: parseFloat(zone['@_y'] ?? '0'),
     w: parseFloat(zone['@_w'] ?? '0'),

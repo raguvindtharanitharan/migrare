@@ -337,9 +337,7 @@ export function DataTable({ title, querySpec, filters, columns, rows: staticRows
     setError(null);
     const body = {
       ...querySpec,
-      filters: Object.fromEntries(
-        (querySpec.filterFields ?? []).map((f) => [f, filters?.[f] ?? null])
-      ),
+      filters: filters ?? {},
       page,
       pageSize,
     };

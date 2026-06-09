@@ -185,6 +185,7 @@ export type ZoneType =
   | 'layout-basic'
   | 'layout-flow'
   | 'paramctrl'
+  | 'filterctrl'   // explicit quick-filter control: type="filter" in the XML
   | 'text'
   | 'empty'
   | 'worksheet'
@@ -207,10 +208,11 @@ export interface Zone {
   isFixed: boolean;
   children: Zone[];
   // Display metadata — populated for paramctrl and titled zones
-  displayLabel?: string;  // from formatted-text inside the zone (the visible title)
-  controlMode?: string;   // paramctrl mode: 'slider' | 'compact' | 'radio' | 'dropdown'
-  paramRef?: string;      // paramctrl parameter reference e.g. '[Parameters].[Revenue View]'
-  showTitle?: boolean;    // whether the zone title is visible
+  displayLabel?: string;   // from formatted-text inside the zone (the visible title)
+  controlMode?: string;    // paramctrl/filterctrl mode: 'slider' | 'compact' | 'radio' | 'dropdown'
+  paramRef?: string;       // paramctrl parameter reference e.g. '[Parameters].[Revenue View]'
+  filterField?: string;    // filterctrl: raw param ref of the field being filtered
+  showTitle?: boolean;     // whether the zone title is visible
 }
 
 export interface Dashboard {
@@ -235,6 +237,10 @@ export interface Filter {
   type: FieldRole; // reuses 'dimension' | 'measure'
   scope: FilterScope;
   appliedTo: string[]; // worksheet names
+  /** Selected/included values for categorical filters (empty = no restriction recorded) */
+  values?: string[];
+  /** True when this filter is explicitly shown as an interactive UI control in the dashboard */
+  visible?: boolean;
 }
 
 export interface Parameter {

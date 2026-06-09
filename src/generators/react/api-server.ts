@@ -86,16 +86,28 @@ export function generateApiServer(
       // measureExpr must be plain (no outer SUM) — the server wraps it in SUM(CASE WHEN ...)
       const measureExpr = resolveFormulaExpr(baseMeasureName, workbook, false);
 
-      // Omit pivotOn when measureExpr references Tableau Parameters or federated sources —
-      // those constructs have no DuckDB equivalent and the query would always 500.
       if (!isUntranslatable(measureExpr)) {
         pivotOn = { expr: pivotExpr, values: pivotValues, measureExpr, totalAlias: baseMeasureName };
+      } else {
+        // Measure references Tableau Parameters/federated — fall back to first raw numeric field
+        const fallbackExpr = findFallbackMeasureExpr(workbook);
+        if (fallbackExpr) {
+          pivotOn = { expr: pivotExpr, values: pivotValues, measureExpr: fallbackExpr, totalAlias: baseMeasureName };
+        }
       }
       measures = []; // measures are expressed as pivot columns
     } else {
       // Filter out measures whose expressions can't run in DuckDB
       measures = resolveQueryMeasures(enc.selectedMeasures, workbook)
         .filter((m) => !isUntranslatable(m.expr));
+      // If all measures were untranslatable, try a raw numeric fallback
+      if (measures.length === 0) {
+        const fallbackExpr = findFallbackMeasureExpr(workbook);
+        if (fallbackExpr) {
+          const fallbackAlias = enc.selectedMeasures[0] ?? 'Total';
+          measures = [{ alias: fallbackAlias, expr: `SUM(${fallbackExpr})` }];
+        }
+      }
     }
 
     // Skip specs with no pivot and no measures — they'd return raw rows that
@@ -120,6 +132,34 @@ export function generateApiServer(
 /** True when an expression contains Tableau-specific constructs DuckDB can't execute. */
 function isUntranslatable(expr: string): boolean {
   return /\bParameters\b|\bfederated\.[a-z0-9]+\b/i.test(expr);
+}
+
+/**
+ * Find a raw (non-calculated) numeric field from the workbook to use as a
+ * fallback measure when the real measure is untranslatable. Returns the
+ * quoted SQL column reference, e.g. `"Item Amount Total"`.
+ */
+/**
+ * Find a raw (non-calculated) numeric field from the workbook to use as a
+ * fallback measure when the real measure is untranslatable.
+ * Skips fields with captions (caption ≠ column name in the parquet).
+ * Returns the quoted SQL column reference, e.g. `"Item Amount Total"`.
+ */
+function findFallbackMeasureExpr(workbook: TableauWorkbook): string | null {
+  const candidates = workbook.fields.filter(
+    (f) =>
+      f.role === 'measure' &&
+      !f.calculation?.formula &&
+      f.dataType === 'real' &&
+      !f.caption && // skip aliased fields — their caption ≠ parquet column name
+      !/Number of Records|Latitude|Longitude/i.test(f.name),
+  );
+  // Prefer fields with "Total" in the name (more likely to be the summary amount column)
+  const field = candidates.sort((a, b) =>
+    (/total/i.test(b.name) ? 1 : 0) - (/total/i.test(a.name) ? 1 : 0)
+  )[0];
+  if (!field) return null;
+  return `"${field.name.replace(/^\[|\]$/g, '')}"`;
 }
 
 // ─── Measure resolver ─────────────────────────────────────────────────────────
@@ -330,12 +370,17 @@ function dimSelect(d: DimSpec | string): string {
 function buildSQL(parquetPath: string, req: QueryRequest): { sql: string; params: (string | null)[] } {
   const params: (string | null)[] = [];
 
-  // WHERE — use ? placeholders (DuckDB Node.js API); alias references work via DuckDB alias chasing
+  // WHERE — use ? placeholders. For calculated dimensions (CASE WHEN etc.) use their
+  // SQL expression rather than the alias, since the alias is not a real column.
+  const dimExprMap = new Map<string, string>(
+    (req.dimensions ?? []).map((d) => [dimAlias(d), dimExpr(d)])
+  );
   const whereParts: string[] = [];
   if (req.filters) {
     for (const [field, value] of Object.entries(req.filters)) {
       if (value !== null && value !== undefined) {
-        whereParts.push(\`  "\${field}" = ?\`);
+        const expr = dimExprMap.get(field) ?? \`"\${field}"\`;
+        whereParts.push(\`  (\${expr}) = ?\`);
         params.push(value);
       }
     }
@@ -453,7 +498,8 @@ interface ActionFilter { field: string; appliedTo: string[]; }
 function extractActionFilters(workbook: TableauWorkbook): ActionFilter[] {
   const result: ActionFilter[] = [];
   for (const f of workbook.filters) {
-    const match = f.name.match(/Action \(([^)]+)\)/);
+    // f.name is now cleaned — use raw f.field to detect action filters
+    const match = (f.field ?? f.name).match(/Action \(([^)]+)\)/);
     if (!match) continue;
     for (const field of match[1].split(',').map((s) => s.trim())) {
       const existing = result.find((af) => af.field === field);

@@ -2,7 +2,7 @@ import type { TableauWorkbook, Zone, MarkType } from '../../parsers/model.js';
 
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
-export type LeafKind = 'worksheet' | 'paramctrl' | 'text';
+export type LeafKind = 'worksheet' | 'paramctrl' | 'filterctrl' | 'text';
 
 export interface LeafZone {
   worksheetOrName: string;
@@ -28,6 +28,12 @@ export function collectLeafZones(zones: Zone[]): LeafZone[] {
         leaves.push({
           worksheetOrName: z.worksheet, kind: 'worksheet',
           displayLabel: z.displayLabel, showTitle: z.showTitle,
+          x: z.x, y: z.y, w: z.w, h: z.h,
+        });
+      } else if (z.type === 'filterctrl') {
+        leaves.push({
+          worksheetOrName: z.filterField ?? z.name ?? '', kind: 'filterctrl',
+          displayLabel: z.displayLabel, controlMode: z.controlMode,
           x: z.x, y: z.y, w: z.w, h: z.h,
         });
       } else if (z.type === 'paramctrl') {
@@ -56,7 +62,8 @@ export function collectLeafZones(zones: Zone[]): LeafZone[] {
 export function buildFiltersByWorksheet(workbook: TableauWorkbook): Map<string, string[]> {
   const map = new Map<string, string[]>();
   for (const f of workbook.filters) {
-    if (f.name.includes('Action (')) continue;
+    // Use raw field ref to detect action filters — f.name is now cleaned
+    if ((f.field ?? f.name).includes('Action (')) continue;
     const raw = f.name.split('].').pop() ?? '';
     const field = raw
       .replace(/^\[/, '').replace(/\]$/, '')
